@@ -1,0 +1,130 @@
+image: python:latest
+
+include:
+    - template: Security/SAST.gitlab-ci.yml
+    - template: Security/Secret-Detection.gitlab-ci.yml
+
+variables:
+    SAST_EXCLUDED_PATHS: unit_tests.py
+
+stages:
+    ##- build
+    - test
+    - package
+    - build
+    - deploystg
+    - apptest
+    - deployprd
+
+unitTest:
+    stage: test
+    before_script:
+        - pip install flask
+        - pip install pytest
+    script:
+        - py.test unit_tests.py
+buildPackage:
+    stage: package
+    before_script:
+        - pip install twine
+    script:
+        - mkdir calcyoulater
+        - ls | grep -v calcyoulater | xargs mv -t calcyoulater
+        - mkdir calcyoulaterpkg
+        - mv calcyoulater/ calcyoulaterpkg
+        - cd calcyoulaterpkg && cd calcyoulater
+        - mv server.py __init__.py
+        - mv -t ../ setup.py MANIFEST.in
+        - cd ..
+        - python setup.py sdist bdist_wheel
+        - TWINE_PASSWORD=${CI_JOB_TOKEN} TWINE_USERNAME=gitlab-ci-token python -m twine upload --repository-url ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi dist/*
+    only:
+        - tags
+    except:
+        - main
+
+buildContainer:
+    stage: build
+    image: docker:19.03.12
+    variables:
+        IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+    services:
+        - docker:19.03.12-dind
+    before_script:
+        - docker pull curlimages/curl
+        - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    script:
+        - docker build --build-arg PAT_NAME=$PAT_NAME --build-arg PAT_VALUE=$PAT_VALUE -t $IMAGE_TAG .
+        - docker image ls
+        - docker run --interactive -p 5000:5000 --name flask-test $IMAGE_TAG &
+        - sleep 10
+        - docker ps
+        - container_ip=$(docker inspect --format '{{ .NetworkSettings.IPAddress }}' flask-test)
+        - container_ip_port="${container_ip}:5000"
+        #- docker run --rm curlimages/curl -L -v $container_ip_port
+        - curloutput=$(docker run --rm curlimages/curl -L -v $container_ip_port)
+        - echo $curloutput | grep -q calcyoulater; echo $?
+        - cat $GCPKEY | docker login -u _json_key --password-stdin https://eu.gcr.io
+        - docker tag $IMAGE_TAG eu.gcr.io/protean-fabric-339611/calcyoulaterlab
+        - docker push eu.gcr.io/protean-fabric-339611/calcyoulaterlab
+
+deployContainer:
+    stage: deploystg
+    image: google/cloud-sdk
+    script:
+        - gcloud auth activate-service-account --key-file "$GCPKEY"
+        - gcloud config set project "protean-fabric-339611"
+        - gcloud run deploy "calcyoulaterlab" --image eu.gcr.io/protean-fabric-339611/calcyoulaterlab --region europe-north1 --platform managed --allow-unauthenticated --port 5000
+        - gcloud run services describe "calcyoulaterlab" --platform managed --region europe-north1 --format 'value(status.url)' > serviceurl.txt
+        - DYNAMIC_ENV_URL=$(cat serviceurl.txt)
+        - echo "DYNAMIC_ENV_URL=$DYNAMIC_ENV_URL" >> deploy.env
+    artifacts:
+        paths:
+            - serviceurl.txt
+        reports:
+            dotenv: deploy.env
+    environment:
+        name: staging
+        url: $DYNAMIC_ENV_URL
+
+smoketest:
+    stage: apptest
+    image: curlimages/curl
+    script:
+        - serviceurl=$(cat serviceurl.txt)
+        - curl -L -v $serviceurl
+performanceTest:
+    stage: apptest
+    image: node:latest
+    before_script:
+        - npm init -y
+        - npm install -g artillery@latest
+    script:
+        - serviceurl=$(cat serviceurl.txt)
+        - artillery run -t $serviceurl -o report.json perftests/perfload.yaml
+        - artillery report --output report.html report.json
+    artifacts:
+        paths:
+            - report.html
+
+deploytoProd:
+    stage: deployprd
+    image: google/cloud-sdk
+    when: manual
+    script:
+        - gcloud auth activate-service-account --key-file "$GCPKEY"
+        - gcloud config set project "protean-fabric-339611"
+        - gcloud run deploy "calcyoulaterprod" --image eu.gcr.io/protean-fabric-339611/calcyoulaterlab --region europe-north1 --platform managed --allow-unauthenticated --port 5000
+        - gcloud run services describe "calcyoulaterprod" --platform managed --region europe-north1 --format 'value(status.url)' > serviceurl.txt
+        - DYNAMIC_ENV_URL=$(cat serviceurl.txt)
+        - echo "DYNAMIC_ENV_URL=$DYNAMIC_ENV_URL" >> deploy.env
+    artifacts:
+        paths:
+            - serviceurl.txt
+        reports:
+            dotenv: deploy.env
+    environment:
+        name: production
+        url: $DYNAMIC_ENV_URL
+    only: 
+        - main

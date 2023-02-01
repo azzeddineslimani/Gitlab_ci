@@ -1,0 +1,26 @@
+config:
+    target: "https://example.com"
+    phases:
+        - duration: 5
+          arrivalRate: 2
+          name: Warm up
+        - duration: 10
+          arrivalRate: 5
+          rampTo: 10
+          name: Ramp up load
+        - duration: 15
+          arrivalRate: 15
+          name: Sustained load
+    ensure:
+        p99: 200
+        maxErrorRate: 0.5
+scenarios:
+    - flow:
+      - get:
+         url: "/add.html"
+      - get:
+         url: "/subtract.html"
+      - get:
+         url: "/multiply.html"
+      - get:
+         url: "/divide.html"
